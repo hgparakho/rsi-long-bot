@@ -11,35 +11,61 @@ API_KEY = os.getenv("BINANCE_API_KEY", "YOUR_BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_SECRET_KEY", "YOUR_BINANCE_SECRET_KEY")
 BASE_URL = "https://testnet.binancefuture.com"
 
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
 app = Flask(__name__)
 
 recent_signals = {}
 
+def send_telegram_message(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        )
+    except Exception as e:
+        print("[ERROR] Telegram failed:", str(e))
+
 def has_open_position(symbol):
-    r = requests.get(
-        BASE_URL + "/fapi/v2/positionRisk",
-        headers={"X-MBX-APIKEY": API_KEY}
-    ).json()
-    pos = next((p for p in r if p["symbol"] == symbol), None)
-    return abs(float(pos["positionAmt"])) > 0 if pos else False
+    try:
+        r = requests.get(
+            BASE_URL + "/fapi/v2/positionRisk",
+            headers={"X-MBX-APIKEY": API_KEY}
+        ).json()
+        pos = next((p for p in r if p["symbol"] == symbol), None)
+        return abs(float(pos["positionAmt"])) > 0 if pos else False
+    except Exception as e:
+        print("[ERROR] Failed to check position:", str(e))
+        return False
 
 def get_total_open_position_value():
-    r = requests.get(
-        BASE_URL + "/fapi/v2/positionRisk",
-        headers={"X-MBX-APIKEY": API_KEY}
-    ).json()
-    return sum([
-        abs(float(p["positionAmt"])) * float(p["markPrice"])
-        for p in r if abs(float(p["positionAmt"])) > 0
-    ])
+    try:
+        r = requests.get(
+            BASE_URL + "/fapi/v2/positionRisk",
+            headers={"X-MBX-APIKEY": API_KEY}
+        ).json()
+        return sum([
+            abs(float(p["positionAmt"])) * float(p["markPrice"])
+            for p in r if abs(float(p["positionAmt"])) > 0
+        ])
+    except Exception as e:
+        print("[ERROR] Failed to get position value:", str(e))
+        return 0
 
 def get_total_balance():
-    r = requests.get(
-        BASE_URL + "/fapi/v2/balance",
-        headers={"X-MBX-APIKEY": API_KEY}
-    ).json()
-    usdt = next((b for b in r if b["asset"] == "USDT"), {"balance": 0})
-    return float(usdt["balance"])
+    try:
+        r = requests.get(
+            BASE_URL + "/fapi/v2/balance",
+            headers={"X-MBX-APIKEY": API_KEY}
+        ).json()
+        usdt = next((b for b in r if b["asset"] == "USDT"), {"balance": 0})
+        return float(usdt["balance"])
+    except Exception as e:
+        print("[ERROR] Failed to get balance:", str(e))
+        return 0
 
 def get_order_quantity(symbol, entry_price, leverage, position_pct):
     total_balance = get_total_balance()
@@ -63,12 +89,22 @@ def send_order(symbol, side, entry_price, tp_pct, sl_pct, position_pct, leverage
     signature = hmac.new(API_SECRET.encode(), query_string.encode(), hashlib.sha256).hexdigest()
     order_params["signature"] = signature
 
-    response = requests.post(
-        BASE_URL + "/fapi/v1/order",
-        headers={"X-MBX-APIKEY": API_KEY},
-        params=order_params
-    )
-    print("[ORDER RESPONSE]", response.json())
+    try:
+        response = requests.post(
+            BASE_URL + "/fapi/v1/order",
+            headers={"X-MBX-APIKEY": API_KEY},
+            params=order_params
+        )
+        result = response.json()
+        print("[ORDER RESPONSE]", result)
+        if "orderId" not in result:
+            print("[ERROR] Order failed to place")
+            send_telegram_message(f"❌ 주문 실패: {symbol} - {result}")
+            return False
+    except Exception as e:
+        print("[EXCEPTION] Order placement failed:", str(e))
+        send_telegram_message(f"⚠️ 주문 오류: {symbol} - {str(e)}")
+        return False
 
     tp_price = round(entry_price * (1 + tp_pct / 100), 4)
     sl_price = round(entry_price * (1 - sl_pct / 100), 4)
@@ -87,12 +123,19 @@ def send_order(symbol, side, entry_price, tp_pct, sl_pct, position_pct, leverage
         sign = hmac.new(API_SECRET.encode(), q_string.encode(), hashlib.sha256).hexdigest()
         cond_order["signature"] = sign
 
-        r = requests.post(
-            BASE_URL + "/fapi/v1/order",
-            headers={"X-MBX-APIKEY": API_KEY},
-            params=cond_order
-        )
-        print(f"[{order_type} RESPONSE]", r.json())
+        try:
+            r = requests.post(
+                BASE_URL + "/fapi/v1/order",
+                headers={"X-MBX-APIKEY": API_KEY},
+                params=cond_order
+            )
+            print(f"[{order_type} RESPONSE]", r.json())
+        except Exception as e:
+            print(f"[EXCEPTION] {order_type} order failed:", str(e))
+            send_telegram_message(f"⚠️ {order_type} 설정 실패: {symbol} - {str(e)}")
+
+    send_telegram_message(f"✅ 진입 완료: {symbol} - {side} / 진입가: {entry_price} / 수량: {quantity}")
+    return True
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -110,8 +153,8 @@ def webhook():
 
         total_balance = get_total_balance()
         open_value = get_total_open_position_value()
-        if open_value / total_balance > 0.5:
-            print("[SKIPPED] Risk limit exceeded (50%).")
+        if open_value / total_balance > 1.0:
+            print("[SKIPPED] Risk limit exceeded (100%).")
             return jsonify({"status": "skipped (risk limit)"}), 200
 
         prev_time = recent_signals.get(symbol)
@@ -122,15 +165,19 @@ def webhook():
             print(f"[STRONG SIGNAL] Double divergence for {symbol}. 20% entry.")
             position_pct = 0.20
 
-        send_order(
+        success = send_order(
             symbol=symbol,
             side="BUY",
             entry_price=price,
-            tp_pct=2.5,
+            tp_pct=3.5,
             sl_pct=1.0,
             position_pct=position_pct,
             leverage=2
         )
+
+        if not success:
+            print("[FAILED] Order placement failed.")
+            return jsonify({"status": "error (order failed)"}), 500
 
     return jsonify({"status": "received"}), 200
 
